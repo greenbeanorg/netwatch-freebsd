@@ -2,6 +2,21 @@
 
 All notable changes to NetWatch will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **Windows: no interfaces and no capture on non-English Windows.** Interface
+  discovery parsed `ipconfig /all`, whose labels are translated and written
+  in the console's OEM code page. On a Russian install every adapter came out
+  named after its mangled header line ("Адаптер Ethernet Ethernet") with no
+  address, so the dashboard showed "no interfaces up" and packet capture
+  failed with "No Npcap adapter matches …". Interfaces now come from
+  `GetAdaptersAddresses`, which reports names in UTF-16 and status and media
+  type as numbers in any display language; ipconfig remains the fallback.
+  PowerShell lookups (adapter GUIDs, statistics, default route) now ask for
+  UTF-8 output, so non-ASCII adapter names such as "Беспроводная сеть" match
+  across all of them.
+
 ## [0.35.2] - 2026-10-04
 
 ### Fixed
