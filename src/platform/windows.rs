@@ -3,6 +3,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::process::Command;
 
+mod iphlpapi;
+
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     // Try PowerShell Get-NetAdapterStatistics for per-interface stats
     if let Ok(stats) = collect_stats_powershell() {
@@ -13,20 +15,33 @@ pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     collect_stats_netstat()
 }
 
-fn collect_stats_powershell() -> Result<HashMap<String, InterfaceStats>> {
+/// Run a PowerShell command and return its stdout as text.
+///
+/// Windows PowerShell writes to a pipe in the console's OEM code page — CP866
+/// on a Russian install, CP936 on a Chinese one — so an adapter named
+/// "Беспроводная сеть" reached us as mojibake and never matched the name the
+/// interface list uses. Switching the output encoding first makes stdout
+/// UTF-8 whatever the locale (no BOM is written to a redirected stream).
+fn powershell(command: &str) -> Option<String> {
     let output = Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
-            "Get-NetAdapterStatistics | ConvertTo-Json",
+            &format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command}"),
         ])
-        .output()?;
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
-    if !output.status.success() {
+fn collect_stats_powershell() -> Result<HashMap<String, InterfaceStats>> {
+    let Some(text) = powershell("Get-NetAdapterStatistics | ConvertTo-Json") else {
         anyhow::bail!("PowerShell Get-NetAdapterStatistics failed");
-    }
+    };
 
-    let text = String::from_utf8_lossy(&output.stdout);
     let mut stats = HashMap::new();
 
     // Output may be a single object or an array
@@ -124,7 +139,24 @@ fn collect_stats_netstat() -> Result<HashMap<String, InterfaceStats>> {
     Ok(stats)
 }
 
+/// Interfaces from `GetAdaptersAddresses`, falling back to parsing ipconfig.
+///
+/// ipconfig's output is translated: on a Russian install the header reads
+/// "Адаптер Ethernet Ethernet:" and the address line "IPv4-адрес", and it is
+/// written in the console's OEM code page besides. The English-only parser
+/// below then names the adapter after the whole mangled header, finds no
+/// address, and every name it returns matches nothing in Get-NetAdapter — so
+/// the dashboard shows no interfaces and capture cannot resolve an Npcap
+/// device. The API reports the same friendly names in UTF-16 and numeric
+/// status/type fields, in any display language, in a few milliseconds.
 pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
+    match iphlpapi::adapters() {
+        Ok(info) => Ok(info),
+        Err(_) => collect_interface_info_ipconfig(),
+    }
+}
+
+fn collect_interface_info_ipconfig() -> Result<Vec<InterfaceInfo>> {
     let output = Command::new("ipconfig").args(["/all"]).output()?;
     let text = String::from_utf8_lossy(&output.stdout);
 
@@ -275,37 +307,21 @@ fn collect_mtu_map() -> HashMap<String, u32> {
 /// the names ipconfig shows to the device pcap opens (issue #51). Empty when
 /// PowerShell is unavailable; the caller falls back to matching by address.
 pub fn adapter_guids() -> HashMap<String, String> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-NetAdapter -IncludeHidden | Select-Object Name,InterfaceGuid | ConvertTo-Json -Compress",
-        ])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            super::npcap_device::parse_adapter_guids(&String::from_utf8_lossy(&out.stdout))
-        }
-        _ => HashMap::new(),
-    }
+    powershell(
+        "Get-NetAdapter -IncludeHidden | Select-Object Name,InterfaceGuid | ConvertTo-Json -Compress",
+    )
+    .map(|text| super::npcap_device::parse_adapter_guids(&text))
+    .unwrap_or_default()
 }
 
 /// Friendly name of the adapter carrying the lowest-metric IPv4 default
 /// route. `InterfaceAlias` is the same name ipconfig and Get-NetAdapter use.
 pub fn default_route_interface() -> Option<String> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue \
-             | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } \
-             | Select-Object -First 1).InterfaceAlias",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let alias = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let alias = powershell(
+        "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue \
+         | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } \
+         | Select-Object -First 1).InterfaceAlias",
+    )?;
+    let alias = alias.trim().to_string();
     (!alias.is_empty()).then_some(alias)
 }
