@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.35.4] - 2026-10-17
 
 ### Fixed
 - **Windows: no interfaces and no capture on non-English Windows.** Interface

@@ -10,7 +10,7 @@
 # below must match Cargo.toml. `spec_version_matches_the_crate` in
 # tests/packaging.rs fails the build if they drift.
 Name:           netwatch
-Version:        0.35.3
+Version:        0.35.4
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -84,6 +84,9 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Sat Oct 17 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.35.4-1
+- Windows interfaces on non-English installs; scrollable interface list
+
 * Mon Oct 05 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.35.3-1
 - FreeBSD interface up-state from IFF_UP
 
