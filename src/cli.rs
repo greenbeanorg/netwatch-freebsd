@@ -288,5 +288,21 @@ mod tests {
                 assert!(text.contains(sub), "{what} is missing the {sub} subcommand");
             }
         }
+
+        for sub in crate::diagnose::episode::SUBCOMMANDS {
+            for (what, text) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+                assert!(
+                    text.split(|c: char| !c.is_ascii_alphanumeric())
+                        .any(|w| w == *sub),
+                    "{what} completion is missing diagnose {sub}"
+                );
+            }
+            // By line: a Windows checkout has CRLF endings.
+            let heading = format!(".B diagnose {sub}");
+            assert!(
+                MAN.lines().any(|l| l.trim_end() == heading),
+                "man page is missing diagnose {sub}"
+            );
+        }
     }
 }
