@@ -1497,7 +1497,7 @@ root ntpd       55089 27 udp6  [2001:506:70cb:6800:: *:*
     /// Unix only: Windows has no executable-path resolver, so `stable_name`
     /// returns None there by design and names are left as scraped — asserted
     /// separately in `canonicalize_is_inert_without_a_resolver`.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn canonicalize_replaces_the_scraped_name_for_a_live_pid() {
         let mut conns = vec![make_conn(
@@ -1538,7 +1538,7 @@ root ntpd       55089 27 udp6  [2001:506:70cb:6800:: *:*
 
     /// On a platform with no executable-path resolver, canonicalisation is
     /// a no-op rather than a name-eraser — the scraped name is all there is.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
     #[test]
     fn canonicalize_is_inert_without_a_resolver() {
         let mut conns = vec![make_conn(
