@@ -298,7 +298,7 @@ fn render_interface_row(f: &mut Frame, app: &App, inner: Rect, i: usize, iface: 
         Span::styled(
             format!(
                 " {:<11}",
-                role_for(&iface.name, info.and_then(|inf| inf.is_wireless))
+                iface_label(info, &iface.name, 11)
             ),
             Style::default().fg(if active { t.brand } else { t.text_muted }),
         ),
@@ -658,6 +658,25 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 /// `is_wireless == None` means the platform layer couldn't tell — we fall
 /// back to the hedged `ethernet/wifi` label for `en*`/`wlan*` names so
 /// behaviour matches the pre-detection world for unsupported platforms.
+/// Column label for an interface: its kernel/OPNsense description when set
+/// (shortened to the leading token — "WAN", "CLIENTS (opt2)" -> "CLIENTS" —
+/// so it reads well in a narrow column), otherwise the name-based role
+/// heuristic. `width` caps the length so a long description can never push the
+/// rate columns out of alignment.
+pub fn iface_label(
+    info: Option<&crate::platform::InterfaceInfo>,
+    name: &str,
+    width: usize,
+) -> String {
+    if let Some(desc) = info.and_then(|i| i.description.as_deref()) {
+        let short = desc.split(" (").next().unwrap_or(desc).trim();
+        if !short.is_empty() {
+            return short.chars().take(width).collect();
+        }
+    }
+    role_for(name, info.and_then(|i| i.is_wireless)).to_string()
+}
+
 pub fn role_for(name: &str, is_wireless: Option<bool>) -> &'static str {
     if name == "lo0" || name == "lo" {
         return "loopback";

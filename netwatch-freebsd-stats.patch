@@ -1,0 +1,173 @@
+diff --git a/src/config.rs b/src/config.rs
+index 71e85a0..90423a8 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -15,7 +15,9 @@ pub struct NetwatchConfig {
+     /// Tick / refresh rate in milliseconds (100–5000)
+     pub refresh_rate_ms: u64,
+ 
+-    /// Preferred capture interface (e.g. "en0"). Empty = auto-detect.
++    /// Preferred capture interface (e.g. "eth0", "en0", "vtnet1"). Empty =
++    /// auto-detect: the interface carrying the default route, else the first
++    /// up, non-loopback NIC with an address.
+     pub capture_interface: String,
+ 
+     /// Show GeoIP column in Connections tab
+diff --git a/src/platform/freebsd.rs b/src/platform/freebsd.rs
+index dee9c68..4aaf56e 100644
+--- a/src/platform/freebsd.rs
++++ b/src/platform/freebsd.rs
+@@ -13,11 +13,12 @@
+ //! `mtu` and per-interface statistics are intentionally left for a follow-up:
+ //! they need extra ioctls / sysctls and are not used by interface selection.
+ 
+-use super::InterfaceInfo;
++use super::{InterfaceInfo, InterfaceStats};
+ use anyhow::Result;
+ use nix::ifaddrs::getifaddrs;
+ use nix::net::if_::InterfaceFlags;
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, HashMap};
++use std::ffi::CStr;
+ 
+ /// One `InterfaceInfo` per interface, built from `getifaddrs`.
+ ///
+@@ -89,6 +90,92 @@ fn parse_route_get_interface(text: &str) -> Option<String> {
+     })
+ }
+ 
++/// Walk `getifaddrs(3)` once, invoking `f(name, if_data)` for every `AF_LINK`
++/// entry. Every interface has exactly one such entry, and it carries the
++/// kernel's cumulative counters and negotiated link speed in an `if_data`.
++///
++/// This centralises the unsafe FFI — and the matching `freeifaddrs` cleanup —
++/// so the two public callers below stay safe and don't each hand-roll the walk
++/// (the same shape `macos::link_speed_bps` already uses for baudrate). Reading
++/// the struct directly avoids forking `netstat -ibn` on every refresh tick,
++/// which matters on a router; it also sidesteps FreeBSD's `netstat` column
++/// layout differing from macOS's (an extra `Idrop` field).
++fn for_each_link_data(mut f: impl FnMut(&str, &nix::libc::if_data)) {
++    let mut ifap: *mut nix::libc::ifaddrs = std::ptr::null_mut();
++    // SAFETY: `getifaddrs` fills `ifap` with an owned list we free below; every
++    // pointer is null-checked before it is dereferenced.
++    if unsafe { nix::libc::getifaddrs(&mut ifap) } != 0 || ifap.is_null() {
++        return;
++    }
++    let mut cur = ifap;
++    while !cur.is_null() {
++        let entry = unsafe { &*cur };
++        cur = entry.ifa_next;
++        if entry.ifa_addr.is_null() || entry.ifa_data.is_null() {
++            continue;
++        }
++        // Only the AF_LINK entry carries `if_data`; the AF_INET/INET6 ones
++        // point `ifa_data` elsewhere (or nowhere).
++        if i32::from(unsafe { (*entry.ifa_addr).sa_family }) != nix::libc::AF_LINK {
++            continue;
++        }
++        let name = unsafe { CStr::from_ptr(entry.ifa_name) }
++            .to_string_lossy()
++            .into_owned();
++        // SAFETY: on an AF_LINK entry `ifa_data` points to a live `if_data`
++        // owned by the list `ifap` still holds.
++        let data = unsafe { &*(entry.ifa_data as *const nix::libc::if_data) };
++        f(&name, data);
++    }
++    // SAFETY: `ifap` came from a successful `getifaddrs` and is freed once.
++    unsafe { nix::libc::freeifaddrs(ifap) };
++}
++
++/// Cumulative per-interface counters from the kernel's `if_data`. Rates are
++/// derived upstream (`collectors::traffic`) by diffing successive samples, so
++/// this only needs to report the running totals; the caller's `saturating_sub`
++/// absorbs the counter reset that happens when an interface bounces.
++///
++/// `signal_dbm` / `tx_retries` stay `None`: they're 802.11 telemetry, and the
++/// wired NICs on a FreeBSD router don't report them through this path.
++pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
++    let mut stats = HashMap::new();
++    for_each_link_data(|name, d| {
++        stats.insert(
++            name.to_string(),
++            InterfaceStats {
++                name: name.to_string(),
++                rx_bytes: d.ifi_ibytes,
++                tx_bytes: d.ifi_obytes,
++                rx_packets: d.ifi_ipackets,
++                tx_packets: d.ifi_opackets,
++                rx_errors: d.ifi_ierrors,
++                tx_errors: d.ifi_oerrors,
++                rx_drops: d.ifi_iqdrops,
++                tx_drops: d.ifi_oqdrops,
++                signal_dbm: None,
++                tx_retries: None,
++            },
++        );
++    });
++    Ok(stats)
++}
++
++/// Negotiated link speed in bits per second from `if_data.ifi_baudrate`, which
++/// FreeBSD reports for real NICs (1 Gb on a `vtnet`, the PHY rate on physical
++/// Ethernet) and leaves at 0 for interfaces without a meaningful line rate
++/// (loopback, some tunnels) — reported here as `None` so the Dense saturation
++/// meter labels itself against the observed peak rather than inventing a ceiling.
++pub fn link_speed_bps(iface: &str) -> Option<u64> {
++    let mut speed = None;
++    for_each_link_data(|name, d| {
++        if name == iface && d.ifi_baudrate > 0 {
++            speed = Some(d.ifi_baudrate);
++        }
++    });
++    speed
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/src/platform/mod.rs b/src/platform/mod.rs
+index 5214c3c..f57e647 100644
+--- a/src/platform/mod.rs
++++ b/src/platform/mod.rs
+@@ -63,13 +63,21 @@ pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
+     #[cfg(target_os = "linux")]
+     return linux::collect_interface_stats();
+ 
++    #[cfg(target_os = "freebsd")]
++    return freebsd::collect_interface_stats();
++
+     #[cfg(target_os = "macos")]
+     return macos::collect_interface_stats();
+ 
+     #[cfg(target_os = "windows")]
+     return windows::collect_interface_stats();
+ 
+-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
++    #[cfg(not(any(
++        target_os = "linux",
++        target_os = "freebsd",
++        target_os = "macos",
++        target_os = "windows"
++    )))]
+     anyhow::bail!("Unsupported platform")
+ }
+ 
+@@ -167,10 +175,17 @@ pub fn link_speed_bps(iface: &str) -> Option<u64> {
+     speed
+ }
+ 
++/// FreeBSD: `if_data.ifi_baudrate` from `getifaddrs`, same source as the
++/// counters in `freebsd::collect_interface_stats` (one syscall serves both).
++#[cfg(target_os = "freebsd")]
++pub fn link_speed_bps(iface: &str) -> Option<u64> {
++    freebsd::link_speed_bps(iface)
++}
++
+ /// Windows would come from `GetIfEntry2`'s `TransmitLinkSpeed`; not wired up
+ /// yet, so the saturation meter falls back to labelling itself against the
+ /// observed peak rather than inventing a ceiling.
+-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
++#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+ pub fn link_speed_bps(_iface: &str) -> Option<u64> {
+     None
+ }

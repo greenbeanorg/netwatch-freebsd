@@ -57,11 +57,19 @@ pub struct InterfaceInfo {
     /// `None` when the OS didn't give us a definitive answer (e.g. loopback,
     /// VPN, virtual interfaces — or the lookup failed).
     pub is_wireless: Option<bool>,
+    /// Human-friendly interface description when the OS provides one. On
+    /// FreeBSD/OPNsense this is the kernel `ifdescr` ("WAN (wan)", "LAN (lan)",
+    /// "CLIENTS (opt2)") surfaced via libpcap; `None` on systems that don't set
+    /// per-interface descriptions, so the UI falls back to the name heuristic.
+    pub description: Option<String>,
 }
 
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     #[cfg(target_os = "linux")]
     return linux::collect_interface_stats();
+
+    #[cfg(target_os = "freebsd")]
+    return freebsd::collect_interface_stats();
 
     #[cfg(target_os = "macos")]
     return macos::collect_interface_stats();
@@ -69,7 +77,12 @@ pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
     #[cfg(target_os = "windows")]
     return windows::collect_interface_stats();
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     anyhow::bail!("Unsupported platform")
 }
 
@@ -167,10 +180,17 @@ pub fn link_speed_bps(iface: &str) -> Option<u64> {
     speed
 }
 
+/// FreeBSD: `if_data.ifi_baudrate` from `getifaddrs`, same source as the
+/// counters in `freebsd::collect_interface_stats` (one syscall serves both).
+#[cfg(target_os = "freebsd")]
+pub fn link_speed_bps(iface: &str) -> Option<u64> {
+    freebsd::link_speed_bps(iface)
+}
+
 /// Windows would come from `GetIfEntry2`'s `TransmitLinkSpeed`; not wired up
 /// yet, so the saturation meter falls back to labelling itself against the
 /// observed peak rather than inventing a ceiling.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub fn link_speed_bps(_iface: &str) -> Option<u64> {
     None
 }

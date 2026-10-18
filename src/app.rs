@@ -4485,6 +4485,7 @@ mod tests {
                 mtu: Some(9000),
                 is_up: true,
                 is_wireless: None,
+                description: None,
             },
             InterfaceInfo {
                 name: "aa".into(),
@@ -4494,6 +4495,7 @@ mod tests {
                 mtu: Some(1500),
                 is_up: false,
                 is_wireless: None,
+                description: None,
             },
         ];
         let make = || {
@@ -4535,6 +4537,7 @@ mod tests {
                 mtu: Some(9000),
                 is_up: true,
                 is_wireless: Some(true),
+                description: None,
             },
             InterfaceInfo {
                 name: "lo0".into(),
@@ -4544,6 +4547,7 @@ mod tests {
                 mtu: Some(1500),
                 is_up: false,
                 is_wireless: None,
+                description: None,
             },
         ];
         let make = || {
@@ -4824,6 +4828,7 @@ mod tests {
             mtu: None,
             is_up,
             is_wireless: None,
+            description: None,
         }
     }
 

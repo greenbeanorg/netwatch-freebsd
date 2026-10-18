@@ -163,6 +163,7 @@ pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
                 mtu,
                 is_up: true, // assume up; will set false if "Media disconnected"
                 is_wireless,
+                description: None,
             });
         } else if let Some(ref mut iface) = current {
             let trimmed = line.trim();

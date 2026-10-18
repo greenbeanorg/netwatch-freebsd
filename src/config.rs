@@ -15,7 +15,9 @@ pub struct NetwatchConfig {
     /// Tick / refresh rate in milliseconds (100–5000)
     pub refresh_rate_ms: u64,
 
-    /// Preferred capture interface (e.g. "en0"). Empty = auto-detect.
+    /// Preferred capture interface (e.g. "eth0", "en0", "vtnet1"). Empty =
+    /// auto-detect: the interface carrying the default route, else the first
+    /// up, non-loopback NIC with an address.
     pub capture_interface: String,
 
     /// Show GeoIP column in Connections tab
