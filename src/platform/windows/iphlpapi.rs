@@ -144,6 +144,7 @@ unsafe fn walk(first: *const AdapterAddresses) -> Vec<InterfaceInfo> {
             mtu: (a.mtu != 0 && a.mtu != u32::MAX).then_some(a.mtu),
             is_up,
             is_wireless: wireless_from_if_type(a.if_type),
+            description: None,
         });
     }
     out

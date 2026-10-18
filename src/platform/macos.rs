@@ -95,6 +95,7 @@ fn parse_ifconfig_output(text: &str) -> Vec<InterfaceInfo> {
                 mtu,
                 is_up,
                 is_wireless: None,
+                description: None,
             });
         } else if let Some(ref mut iface) = current {
             let trimmed = line.trim();

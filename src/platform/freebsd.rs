@@ -99,6 +99,7 @@ pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
                 mtu: None,
                 is_up: false,
                 is_wireless: None,
+                description: None,
             })
             .collect();
     }
@@ -200,6 +201,7 @@ fn parse_ifconfig_output(text: &str) -> Vec<InterfaceInfo> {
                 mtu,
                 is_up,
                 is_wireless: None,
+                description: None,
             });
         } else if let Some(ref mut iface) = current {
             let trimmed = line.trim();
@@ -216,6 +218,14 @@ fn parse_ifconfig_output(text: &str) -> Vec<InterfaceInfo> {
                 iface.mac = trimmed.split_whitespace().nth(1).map(|s| s.to_string());
             } else if let Some(media) = trimmed.strip_prefix("media:") {
                 iface.is_wireless = Some(media.to_ascii_uppercase().contains("802.11"));
+            } else if let Some(desc) = trimmed.strip_prefix("description:") {
+                // `ifconfig <if> description "..."` — OPNsense writes its
+                // interface names here ("WAN (wan)"); stock FreeBSD leaves it
+                // unset, so the line is simply absent.
+                let desc = desc.trim();
+                if !desc.is_empty() {
+                    iface.description = Some(desc.to_string());
+                }
             }
         }
     }
@@ -450,6 +460,58 @@ em1: flags=8822<BROADCAST,SIMPLEX,MULTICAST> metric 0 mtu 1500
             None,
             "no media line printed (link down) — stay None rather than guess"
         );
+    }
+
+    /// OPNsense names its interfaces through `ifconfig description`, which
+    /// FreeBSD prints as its own continuation line; an interface without one
+    /// (a fresh VLAN, stock FreeBSD) prints no such line at all.
+    const OPNSENSE_IFCONFIG: &str = "\
+vtnet0: flags=1008843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1500
+\tdescription: LAN (lan)
+\toptions=800a8<VLAN_MTU,JUMBO_MTU,VLAN_HWCSUM,LINKSTATE>
+\tether ac:8f:a9:d7:db:a0
+\tinet 10.79.10.1 netmask 0xffffff00 broadcast 10.79.10.255
+\tmedia: Ethernet autoselect (10Gbase-T <full-duplex>)
+\tstatus: active
+vlan02: flags=1008843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1500
+\tdescription: CLIENTS (opt2)
+\tether ac:8f:a9:d7:db:a0
+\tinet 10.79.30.1 netmask 0xffffff00 broadcast 10.79.30.255
+\tgroups: vlan
+\tvlan: 30 vlanproto: 802.1q vlanpcp: 0 parent interface: vtnet0
+vlan06: flags=1008843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1500
+\tether ac:8f:a9:d7:db:a0
+\tgroups: vlan
+\tvlan: 10 vlanproto: 802.1q vlanpcp: 0 parent interface: vtnet0
+";
+
+    #[test]
+    fn parse_ifconfig_reads_opnsense_descriptions() {
+        let ifaces = parse_ifconfig_output(OPNSENSE_IFCONFIG);
+        let desc = |name: &str| {
+            ifaces
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap()
+                .description
+                .clone()
+        };
+        assert_eq!(desc("vtnet0").as_deref(), Some("LAN (lan)"));
+        assert_eq!(desc("vlan02").as_deref(), Some("CLIENTS (opt2)"));
+        assert_eq!(desc("vlan06"), None, "no description line — stay None");
+        // The extra line must not disturb the fields parsed around it.
+        let lan = ifaces.iter().find(|i| i.name == "vtnet0").unwrap();
+        assert_eq!(lan.ipv4.as_deref(), Some("10.79.10.1"));
+        assert_eq!(lan.mtu, Some(1500));
+        assert_eq!(lan.is_wireless, Some(false));
+    }
+
+    #[test]
+    fn parse_ifconfig_without_descriptions_leaves_them_none() {
+        // Stock FreeBSD: the shared fixture has no description lines.
+        assert!(parse_ifconfig_output(IFCONFIG_OUTPUT)
+            .iter()
+            .all(|i| i.description.is_none()));
     }
 
     #[test]

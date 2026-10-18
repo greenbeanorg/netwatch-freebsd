@@ -189,6 +189,7 @@ pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
             mtu,
             is_up,
             is_wireless,
+            description: None,
         });
     }
 

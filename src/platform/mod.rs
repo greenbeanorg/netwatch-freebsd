@@ -82,6 +82,11 @@ pub struct InterfaceInfo {
     /// `None` when the OS didn't give us a definitive answer (e.g. loopback,
     /// VPN, virtual interfaces — or the lookup failed).
     pub is_wireless: Option<bool>,
+    /// Administrator-set interface description, where the OS has one: the
+    /// FreeBSD `ifconfig` `description:` line, which OPNsense fills with its
+    /// interface names ("WAN (wan)", "CLIENTS (opt2)"). `None` on platforms
+    /// or interfaces without one, so the UI falls back to the role heuristic.
+    pub description: Option<String>,
 }
 
 /// Interface names are the host's to choose: Linux accepts any byte but `/`,
@@ -253,6 +258,8 @@ fn displayable_info(infos: Vec<InterfaceInfo>) -> Vec<InterfaceInfo> {
         .into_iter()
         .map(|mut info| {
             info.name = display_owned(info.name);
+            // Free text an admin typed, so it gets the same treatment as a name.
+            info.description = info.description.map(display_owned);
             info
         })
         .collect()
@@ -338,8 +345,11 @@ mod interface_name_tests {
             mtu: None,
             is_up: true,
             is_wireless: None,
+            description: Some(HOSTILE.into()),
         };
-        assert_eq!(displayable_info(vec![info])[0].name, "eth·]0;owned··0");
+        let info = displayable_info(vec![info]);
+        assert_eq!(info[0].name, "eth·]0;owned··0");
+        assert_eq!(info[0].description.as_deref(), Some("eth·]0;owned··0"));
     }
 }
 

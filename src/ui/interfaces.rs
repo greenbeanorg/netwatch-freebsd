@@ -42,8 +42,8 @@ pub fn sort_interfaces(
                 cmp_ip(ip_a, ip_b)
             }
             "Role" => cmp_case_insensitive(
-                role_for_iface(&a.name, interface_info),
-                role_for_iface(&b.name, interface_info),
+                &iface_label_for(&a.name, interface_info),
+                &iface_label_for(&b.name, interface_info),
             ),
             "RX/s" | "Rx Rate" | "RX B/s" => cmp_f64(a.rx_rate, b.rx_rate),
             "TX/s" | "Tx Rate" | "TX B/s" => cmp_f64(a.tx_rate, b.tx_rate),
@@ -321,10 +321,7 @@ fn render_interface_row(
         ),
         Span::styled(format!(" {:<19}", ip), Style::default().fg(main_color)),
         Span::styled(
-            format!(
-                " {:<11}",
-                role_for(&iface.name, info.and_then(|inf| inf.is_wireless))
-            ),
+            format!(" {:<w$}", iface_label(info, &iface.name), w = ROLE_W),
             Style::default().fg(if active { t.brand } else { t.text_muted }),
         ),
         Span::styled(
@@ -403,8 +400,8 @@ fn render_detail_panel(f: &mut Frame, app: &App, interfaces: &[InterfaceTraffic]
         .map(|m| format!("MTU {}", m))
         .unwrap_or_default();
     let role = selected
-        .map(|i| role_for_iface(&i.name, &app.interface_info))
-        .unwrap_or("");
+        .map(|i| iface_label_for(&i.name, &app.interface_info))
+        .unwrap_or_default();
     let title_right = if !role.is_empty() || !mtu.is_empty() {
         format!(" {}  {}   ↑↓ to switch ", role, mtu)
     } else {
@@ -731,9 +728,72 @@ pub fn role_for_iface(
     role_for(name, is_wireless)
 }
 
+/// Width of the Role column, shared by the row renderer and `iface_label`'s
+/// truncation so a long description can never push the rate columns over.
+const ROLE_W: usize = 11;
+
+/// What the Role column shows: the interface's description when the OS has
+/// one, cut to its leading name — OPNsense's "CLIENTS (opt2)" reads as
+/// "CLIENTS" — otherwise the name-based [`role_for`] category.
+pub fn iface_label(info: Option<&crate::platform::InterfaceInfo>, name: &str) -> String {
+    if let Some(desc) = info.and_then(|i| i.description.as_deref()) {
+        let short = desc.split(" (").next().unwrap_or(desc).trim();
+        if !short.is_empty() {
+            return short.chars().take(ROLE_W).collect();
+        }
+    }
+    role_for(name, info.and_then(|i| i.is_wireless)).to_string()
+}
+
+/// [`iface_label`] looked up from `interface_info` by name.
+pub fn iface_label_for(name: &str, interface_info: &[crate::platform::InterfaceInfo]) -> String {
+    iface_label(interface_info.iter().find(|i| i.name == name), name)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::role_for;
+    use super::{iface_label, role_for, ROLE_W};
+    use crate::platform::InterfaceInfo;
+
+    fn described(name: &str, description: Option<&str>) -> InterfaceInfo {
+        InterfaceInfo {
+            name: name.into(),
+            ipv4: None,
+            ipv6: None,
+            mac: None,
+            mtu: None,
+            is_up: true,
+            is_wireless: Some(false),
+            description: description.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn iface_label_shows_the_opnsense_name() {
+        let wan = described("vtnet1", Some("WAN (wan)"));
+        assert_eq!(iface_label(Some(&wan), "vtnet1"), "WAN");
+        let clients = described("vlan02", Some("CLIENTS (opt2)"));
+        assert_eq!(iface_label(Some(&clients), "vlan02"), "CLIENTS");
+        // A description without OPNsense's "(optN)" suffix is used whole.
+        let plain = described("igb0", Some("uplink"));
+        assert_eq!(iface_label(Some(&plain), "igb0"), "uplink");
+    }
+
+    #[test]
+    fn iface_label_falls_back_to_the_role() {
+        let bare = described("vlan06", None);
+        assert_eq!(iface_label(Some(&bare), "vlan06"), "ethernet");
+        assert_eq!(iface_label(None, "wg0"), "vpn");
+        // A blank description is no description.
+        let blank = described("em0", Some("   "));
+        assert_eq!(iface_label(Some(&blank), "em0"), "ethernet");
+    }
+
+    #[test]
+    fn iface_label_never_outgrows_the_column() {
+        let long = described("vlan09", Some("SECURITYCAMERAS (opt9)"));
+        assert_eq!(iface_label(Some(&long), "vlan09").chars().count(), ROLE_W);
+    }
 
     #[test]
     fn role_for_uses_wireless_flag_over_name_prefix() {

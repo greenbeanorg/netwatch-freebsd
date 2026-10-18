@@ -4,6 +4,14 @@ All notable changes to NetWatch will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **FreeBSD: interface descriptions in the Interfaces tab.** The Role column
+  shows an interface's `ifconfig` description when one is set, so an
+  OPNsense router lists its interfaces as WAN, LAN, CLIENTS, IOT and so on
+  instead of `ethernet`. The text comes from the `ifconfig` output already
+  parsed for addresses; there is no extra command. It is sanitized like an
+  interface name, and interfaces without a description show the usual role.
+
 ### Dependencies
 - nix 0.29 → 0.31, brotli 8 → 9, maxminddb 0.27 → 0.32, toml_edit 0.22 →
   0.25, and every semver-compatible update (`cargo update`). These are the

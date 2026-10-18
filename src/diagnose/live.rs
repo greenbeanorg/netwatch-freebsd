@@ -986,6 +986,7 @@ mod tests {
             mtu: None,
             is_up: true,
             is_wireless,
+            description: None,
         }
     }
 
