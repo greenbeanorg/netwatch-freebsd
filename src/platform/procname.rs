@@ -23,12 +23,12 @@
 //! `.../claude/versions/2.1.219` → `claude` while leaving `python3.12`,
 //! `7z` and `Google Chrome Helper (GPU)` exactly as they are.
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 use std::path::{Path, PathBuf};
 
 /// Directory names that describe *where* a binary lives rather than *what*
 /// it is. Skipped when walking up from a version-named executable.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 const GENERIC_DIRS: &[&str] = &[
     "versions",
     "version",
@@ -54,7 +54,7 @@ const GENERIC_DIRS: &[&str] = &[
 /// Deliberately strict: a component containing any letter other than a
 /// leading `v` is a name, not a version. That is what keeps `python3.12`,
 /// `7z` and `libexec2` from being collapsed into their parent directory.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 fn looks_like_version(s: &str) -> bool {
     let body = s.strip_prefix('v').unwrap_or(s);
     if body.is_empty() {
@@ -89,7 +89,7 @@ fn looks_like_version(s: &str) -> bool {
 /// Derive the identity from an executable path.
 ///
 /// Exposed for testing — the path is normally supplied by the kernel.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 pub fn name_from_path(path: &Path) -> Option<String> {
     let base = path.file_name()?.to_string_lossy().into_owned();
     if !looks_like_version(&base) {
@@ -153,24 +153,69 @@ pub fn executable_path(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "freebsd")]
+pub fn executable_path(pid: u32) -> Option<PathBuf> {
+    use nix::libc::{
+        c_int, c_uint, c_void, size_t, sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME,
+    };
+
+    // A pid that would wrap to a negative c_int is not a real process, and
+    // FreeBSD reads -1 as "the current process" for KERN_PROC_PATHNAME — so
+    // reject out-of-range pids rather than accidentally returning our own path.
+    if pid > i32::MAX as u32 {
+        return None;
+    }
+
+    // MIB: kern.proc.pathname.<pid> — the kernel's own record of the pid's
+    // executable, which a process cannot forge (unlike argv[0]). No subprocess.
+    let mib: [c_int; 4] = [CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, pid as c_int];
+    let mut buf = vec![0u8; 1024]; // PATH_MAX on FreeBSD
+    let mut len: size_t = buf.len() as size_t;
+    // SAFETY: `mib` has exactly `namelen` (4) elements; `buf` is a live
+    // allocation of `len` bytes; sysctl writes at most `len` and updates `len`
+    // to the count written. No `newp`, so the write args are null/0.
+    let rc = unsafe {
+        sysctl(
+            mib.as_ptr(),
+            mib.len() as c_uint,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    // `len` includes the trailing NUL; drop it (and any padding) before decode.
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 pub fn executable_path(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
 /// Stable identity for a pid, or `None` when the kernel won't tell us and the
 /// caller should keep whatever name it already had.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 pub fn stable_name(pid: u32) -> Option<String> {
     name_from_path(&executable_path(pid)?)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 pub fn stable_name(_pid: u32) -> Option<String> {
     None
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 mod tests {
     use super::*;
 
@@ -183,6 +228,16 @@ mod tests {
         assert_eq!(n("/usr/bin/curl").as_deref(), Some("curl"));
         assert_eq!(n("/usr/bin/python3.12").as_deref(), Some("python3.12"));
         assert_eq!(n("/opt/homebrew/bin/7z").as_deref(), Some("7z"));
+    }
+
+    /// The point of the FreeBSD sysctl arm: sockstat truncates COMMAND to
+    /// ~10 chars ("sshd-sessi"), while the kernel executable path restores the
+    /// full identity — none of these are version-named, so they pass through.
+    #[test]
+    fn freebsd_daemon_paths_keep_full_name() {
+        assert_eq!(n("/usr/sbin/sshd-session").as_deref(), Some("sshd-session"));
+        assert_eq!(n("/usr/local/sbin/unbound").as_deref(), Some("unbound"));
+        assert_eq!(n("/usr/sbin/ntpd").as_deref(), Some("ntpd"));
     }
 
     /// The untruncated name is the whole point — this is what `comm` cuts to
