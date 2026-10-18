@@ -24,6 +24,10 @@ pub enum AttributionSource {
     Lsof,
     Pktap,
     Ebpf,
+    /// FreeBSD `sockstat(1)` — a userspace socket-table scrape, the FreeBSD
+    /// analogue of `lsof`/`ss`. Not kernel-attributed, so it groups with
+    /// `Lsof` (never with the `Pktap`/`Ebpf` kernel sources) for UI purposes.
+    Sockstat,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -316,7 +320,14 @@ impl ConnectionCollector {
             let mut result = parse_linux_connections();
             #[cfg(target_os = "windows")]
             let mut result = parse_windows_connections();
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            #[cfg(target_os = "freebsd")]
+            let mut result = parse_freebsd_connections();
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows",
+                target_os = "freebsd"
+            )))]
             let mut result: Vec<Connection> = Vec::new();
 
             let (stream_bytes, app_protos, anomalies, handshake_rtts) = {
@@ -1113,6 +1124,86 @@ fn resolve_pids(pids: &[u32]) -> HashMap<u32, String> {
     map
 }
 
+/// FreeBSD connection table via `sockstat(1)` — the native equivalent of the
+/// Linux `ss`/`lsof` scrape. `-46` limits output to IPv4/IPv6 internet sockets
+/// (skipping unix-domain sockets), one row per socket with the owning process.
+/// Runs on the ConnectionCollector's background thread (busy-flag guarded,
+/// ~1 Hz), never on the capture path, so it meets the "attribution must not
+/// block capture" requirement with no extra machinery.
+///
+/// Like `ss -p`/`lsof`, sockstat only attributes sockets the caller may see:
+/// as root (how netwatch runs on OPNsense) that's everything. Names are the
+/// kernel `comm`; where `procname::stable_name` can resolve a pid to an
+/// executable path, `canonicalize_process_names` upgrades them afterwards.
+#[cfg(target_os = "freebsd")]
+fn parse_freebsd_connections() -> Vec<Connection> {
+    match Command::new("sockstat").args(["-46"]).output() {
+        Ok(out) => parse_sockstat(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Parse `sockstat -46` output into connections. Anchored on the PROTO column
+/// (`tcp4`/`tcp6`/`udp4`/`udp6`) rather than fixed positions, so a multi-word
+/// COMMAND or the two-word "LOCAL ADDRESS"/"FOREIGN ADDRESS" header can't
+/// misalign it — the header has no proto token and is skipped. Rows the kernel
+/// shows without an owning process (USER/PID `?`) parse as unattributed rather
+/// than being dropped.
+///
+/// State is derived from the foreign address (`*:*` → LISTEN, else
+/// ESTABLISHED) because plain sockstat doesn't report TCP state; `sockstat -s`
+/// could refine this once its exact column layout is confirmed on-target.
+#[cfg(any(target_os = "freebsd", test))]
+fn parse_sockstat(text: &str) -> Vec<Connection> {
+    let mut connections = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let Some(pi) = f
+            .iter()
+            .position(|c| matches!(*c, "tcp4" | "tcp6" | "udp4" | "udp6"))
+        else {
+            continue; // header, unix-domain sockets, blank lines
+        };
+        // USER COMMAND… PID FD PROTO LOCAL FOREIGN — need PID/FD before PROTO
+        // and LOCAL/FOREIGN after it.
+        if pi < 3 || f.len() < pi + 3 {
+            continue;
+        }
+        let protocol = if f[pi].starts_with("tcp") { "TCP" } else { "UDP" }.to_string();
+        let pid = f[pi - 2].parse::<u32>().ok();
+        let command = f[1..pi - 2].join(" ");
+        let process_name = match command.as_str() {
+            "" | "?" | "-" => None,
+            _ => Some(command),
+        };
+        let local_addr = f[pi + 1].to_string();
+        let remote_addr = f[pi + 2].to_string();
+        let state = if remote_addr == "*:*" || remote_addr.ends_with(":*") {
+            "LISTEN"
+        } else {
+            "ESTABLISHED"
+        }
+        .to_string();
+
+        connections.push(Connection {
+            protocol,
+            local_addr,
+            remote_addr,
+            state,
+            pid,
+            process_name,
+            handshake_rtt_us: None,
+            rx_rate: None,
+            tx_rate: None,
+            attribution: AttributionSource::Sockstat,
+            app_protocol: None,
+            retransmits: 0,
+            out_of_order: 0,
+        });
+    }
+    connections
+}
+
 #[cfg(target_os = "windows")]
 fn parse_windows_connections() -> Vec<Connection> {
     let output = match Command::new("netstat").args(["-ano"]).output() {
@@ -1260,6 +1351,75 @@ pub fn export_csv(connections: &[Connection], path: &str) -> Result<usize, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── FreeBSD sockstat parsing ────────────────────────────────────────
+
+    const SOCKSTAT_46: &str = "\
+USER     COMMAND    PID   FD PROTO  LOCAL ADDRESS         FOREIGN ADDRESS
+root     sshd      1234    5 tcp4   10.79.10.1:22         10.79.10.50:52341
+root     sshd       988    4 tcp4   *:22                  *:*
+unbound  unbound    901   20 udp4   127.0.0.1:53          *:*
+root     python3.11 1500   7 tcp4   10.79.10.1:8080       104.18.2.1:443
+?        ?            ?    ? tcp4   10.79.10.1:80         203.0.113.9:44321
+root     sshd      1234    6 tcp6   *:22                  *:*
+";
+
+    fn find<'a>(v: &'a [Connection], local: &str) -> &'a Connection {
+        v.iter().find(|c| c.local_addr == local).expect("connection")
+    }
+
+    #[test]
+    fn sockstat_skips_header_and_parses_all_rows() {
+        let conns = parse_sockstat(SOCKSTAT_46);
+        assert_eq!(conns.len(), 6, "header must be skipped, 6 data rows kept");
+        assert!(conns.iter().all(|c| c.attribution == AttributionSource::Sockstat));
+    }
+
+    #[test]
+    fn sockstat_attributes_established_connection() {
+        let conns = parse_sockstat(SOCKSTAT_46);
+        let c = find(&conns, "10.79.10.1:22");
+        assert_eq!(c.protocol, "TCP");
+        assert_eq!(c.pid, Some(1234));
+        assert_eq!(c.process_name.as_deref(), Some("sshd"));
+        assert_eq!(c.remote_addr, "10.79.10.50:52341");
+        assert_eq!(c.state, "ESTABLISHED");
+    }
+
+    #[test]
+    fn sockstat_detects_listeners_via_wildcard_foreign() {
+        let conns = parse_sockstat(SOCKSTAT_46);
+        assert_eq!(find(&conns, "*:22").state, "LISTEN"); // tcp4 + tcp6 both *:22
+        assert_eq!(find(&conns, "127.0.0.1:53").state, "LISTEN"); // bound udp
+    }
+
+    #[test]
+    fn sockstat_multiword_command_stays_intact() {
+        // A comm with a space must not shift the PID/PROTO columns.
+        let line = "user     Web Content 4242  9 tcp4   10.0.0.2:5000        1.2.3.4:443\n";
+        let c = &parse_sockstat(line)[0];
+        assert_eq!(c.pid, Some(4242));
+        assert_eq!(c.process_name.as_deref(), Some("Web Content"));
+        assert_eq!(c.protocol, "TCP");
+        assert_eq!(c.remote_addr, "1.2.3.4:443");
+    }
+
+    #[test]
+    fn sockstat_keeps_unattributed_rows() {
+        // Kernel-owned/orphaned sockets (USER/PID `?`) are retained, not dropped.
+        let conns = parse_sockstat(SOCKSTAT_46);
+        let c = find(&conns, "10.79.10.1:80");
+        assert_eq!(c.pid, None);
+        assert_eq!(c.process_name, None);
+        assert_eq!(c.state, "ESTABLISHED");
+    }
+
+    #[test]
+    fn sockstat_ignores_junk_and_unix_sockets() {
+        // No proto token -> skipped, never panics.
+        assert!(parse_sockstat("garbage line with no proto\n\n").is_empty());
+        assert!(parse_sockstat("root sh 12 3 stream /var/run/x.sock\n").is_empty());
+    }
 
     // ── process identity (issue: version-named + truncated comm) ────────
 
