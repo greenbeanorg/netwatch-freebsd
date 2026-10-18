@@ -733,7 +733,18 @@ impl App {
         // Start ambient packet capture so the Connections view can show
         // per-connection rates. If this fails (no sudo, no interface), the
         // error surfaces on the Packets tab and rate columns stay blank.
-        packet_collector.start_capture(&capture_interface, bpf_filter_active.as_deref());
+        // An empty interface here means auto-selection found nothing capturable
+        // (no config value, no enumerated NIC, nothing from libpcap). Opening
+        // "" would fail with a confusing libpcap error, so skip the auto-start
+        // and let the user pick an interface instead of chasing a phantom.
+        if capture_interface.is_empty() {
+            tracing::warn!(
+                target: "netwatch::capture",
+                "no capture interface auto-selected; set capture_interface in the config or pick one in the UI"
+            );
+        } else {
+            packet_collector.start_capture(&capture_interface, bpf_filter_active.as_deref());
+        }
 
         // On macOS, try to start PKTAP capture for kernel-level per-packet
         // process attribution. Requires root — falls back gracefully to lsof
@@ -1055,13 +1066,65 @@ impl App {
             }
         }
         info.iter()
-            .find(|i| i.is_up && i.ipv4.is_some() && !Self::is_loopback_name(&i.name))
+            .find(|i| {
+                i.is_up
+                    && i.ipv4.is_some()
+                    && !Self::is_loopback_name(&i.name)
+                    && !Self::is_control_interface_name(&i.name)
+            })
             .or_else(|| {
-                info.iter()
-                    .find(|i| i.is_up && !Self::is_loopback_name(&i.name))
+                info.iter().find(|i| {
+                    i.is_up
+                        && !Self::is_loopback_name(&i.name)
+                        && !Self::is_control_interface_name(&i.name)
+                })
             })
             .map(|i| i.name.clone())
-            .unwrap_or_else(|| "en0".to_string())
+            // No enumerated candidate (e.g. a platform whose
+            // `collect_interface_info` returned nothing): ask libpcap directly
+            // rather than guess a device name. An empty string means "nothing
+            // to capture on" and is surfaced to the user — never a phantom
+            // `en0`, which is where this used to land on FreeBSD/OPNsense.
+            .or_else(Self::first_libpcap_capturable)
+            .unwrap_or_default()
+    }
+
+    /// BSD / OPNsense pseudo-interfaces that libpcap will enumerate but that
+    /// carry no traffic worth monitoring. The digit-suffix check keeps this
+    /// from snagging real NICs whose names merely start with these letters
+    /// (`eno1`, `encp*`), and the prefixes don't collide with Linux/macOS/
+    /// Windows device names, so it is safe to apply on every platform.
+    fn is_control_interface_name(name: &str) -> bool {
+        const PREFIXES: [&str; 4] = ["enc", "pfsync", "pflog", "usbus"];
+        PREFIXES.iter().any(|p| {
+            name.strip_prefix(p)
+                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        })
+    }
+
+    /// Last-resort capture-device discovery straight from libpcap
+    /// (`pcap_findalldevs` — the same list `tcpdump -D` prints), used only
+    /// when interface enumeration yielded no usable candidate. Prefers an up,
+    /// non-loopback, non-control device that has an address; falls back to any
+    /// up non-loopback device. Returns `None` when pcap has nothing to offer.
+    fn first_libpcap_capturable() -> Option<String> {
+        let devices = pcap::Device::list().ok()?;
+        devices
+            .iter()
+            .find(|d| {
+                d.flags.is_up()
+                    && !d.flags.is_loopback()
+                    && !Self::is_control_interface_name(&d.name)
+                    && !d.addresses.is_empty()
+            })
+            .or_else(|| {
+                devices.iter().find(|d| {
+                    d.flags.is_up()
+                        && !d.flags.is_loopback()
+                        && !Self::is_control_interface_name(&d.name)
+                })
+            })
+            .map(|d| d.name.clone())
     }
 
     fn capturable_interfaces(&self) -> Vec<String> {
@@ -4807,6 +4870,62 @@ mod tests {
         ];
         // No UP interface with IPv4 (besides lo) → any UP non-loopback.
         assert_eq!(App::pick_capture_interface(&info, None), "eno1");
+    }
+
+    #[test]
+    fn pick_capture_opnsense_prefers_default_route_wan() {
+        // OPNsense: LAN + five VLANs + WAN are all UP with an IPv4, so
+        // "first UP with IPv4" is ambiguous — the default route (WAN) breaks
+        // the tie deterministically.
+        let info = vec![
+            net_iface("lo0", true, Some("127.0.0.1")),
+            net_iface("vtnet0", true, Some("10.79.10.1")),
+            net_iface("vtnet1", true, Some("104.182.185.11")),
+            net_iface("vlan01", true, Some("10.79.20.1")),
+            net_iface("vlan03", true, Some("10.79.40.1")),
+            net_iface("pflog0", true, None),
+        ];
+        assert_eq!(App::pick_capture_interface(&info, Some("vtnet1")), "vtnet1");
+    }
+
+    #[test]
+    fn pick_capture_never_selects_control_or_loopback_interfaces() {
+        // Even with no default-route hint, pflog0/pfsync0/enc0 and loopback
+        // must never be auto-selected; the first real UP NIC with an IPv4 wins.
+        let info = vec![
+            net_iface("lo0", true, Some("127.0.0.1")),
+            net_iface("pflog0", true, None),
+            net_iface("pfsync0", true, None),
+            net_iface("enc0", true, None),
+            net_iface("vtnet0", true, Some("10.79.10.1")),
+        ];
+        assert_eq!(App::pick_capture_interface(&info, None), "vtnet0");
+    }
+
+    #[test]
+    fn pick_capture_empty_enumeration_is_never_en0() {
+        // The core regression: an empty interface list plus no route hint used
+        // to fall through to a hard-coded "en0". It must now resolve via
+        // libpcap or to an empty string, but never to the phantom en0.
+        // (First-libpcap-capturable is environment-dependent, so we only
+        // assert the invariant that mattered.)
+        assert_ne!(App::pick_capture_interface(&[], None), "en0");
+    }
+
+    #[test]
+    fn is_control_interface_name_matches_only_pseudo_ifaces() {
+        for name in ["enc0", "pfsync0", "pflog0", "usbus0", "usbus1"] {
+            assert!(
+                App::is_control_interface_name(name),
+                "{name} should be treated as a control interface"
+            );
+        }
+        for name in ["vtnet1", "eno1", "igb0", "ix1", "em0", "wg0", "vlan02", "enc"] {
+            assert!(
+                !App::is_control_interface_name(name),
+                "{name} should NOT be treated as a control interface"
+            );
+        }
     }
 }
 

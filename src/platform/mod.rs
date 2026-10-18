@@ -2,6 +2,11 @@
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+/// FreeBSD / OPNsense interface enumeration and default-route lookup. Without
+/// it, every entry point below fell to the `not(any(...))` arm on FreeBSD and
+/// the capture picker had no interfaces to choose from (issue: en0 on OPNsense).
+#[cfg(target_os = "freebsd")]
+pub mod freebsd;
 /// Locating Npcap before the capture path needs it. Windows only, and called
 /// from `main` before anything touches libpcap.
 #[cfg(target_os = "windows")]
@@ -76,13 +81,21 @@ pub fn default_route_interface() -> Option<String> {
     #[cfg(target_os = "linux")]
     return linux::default_route_interface();
 
+    #[cfg(target_os = "freebsd")]
+    return freebsd::default_route_interface();
+
     #[cfg(target_os = "macos")]
     return macos::default_route_interface();
 
     #[cfg(target_os = "windows")]
     return windows::default_route_interface();
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     None
 }
 
@@ -166,13 +179,21 @@ pub fn collect_interface_info() -> Result<Vec<InterfaceInfo>> {
     #[cfg(target_os = "linux")]
     return linux::collect_interface_info();
 
+    #[cfg(target_os = "freebsd")]
+    return freebsd::collect_interface_info();
+
     #[cfg(target_os = "macos")]
     return macos::collect_interface_info();
 
     #[cfg(target_os = "windows")]
     return windows::collect_interface_info();
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     anyhow::bail!("Unsupported platform")
 }
 
