@@ -54,6 +54,12 @@ Each change is a self-contained commit with tests:
 
 ## Validation
 
+![NetWatch Interfaces tab on OPNsense, with the Role column showing WAN, LAN, SERVERS, CLIENTS](docs/opnsense-roles.png)
+
+*The Interfaces tab on the router with the `opnsense-interface-descriptions`
+branch: OPNsense names in the Role column, and `wg0`, which has no
+description, falling back to `vpn`.*
+
 - **Real hardware.** Ran on OPNsense 15.1 (FreeBSD 15.1-RELEASE) with a WAN, a LAN,
   six VLANs and WireGuard. Auto-selection picked the WAN. The interfaces tab
   showed live per-VLAN rates and the OPNsense names. Connections showed
