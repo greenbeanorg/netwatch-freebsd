@@ -1156,6 +1156,11 @@ fn parse_freebsd_connections() -> Vec<Connection> {
 #[cfg(any(target_os = "freebsd", test))]
 fn parse_sockstat(text: &str) -> Vec<Connection> {
     let mut connections = Vec::new();
+    // Privsep daemons (sshd) list one connection under several pids/fds; the
+    // kernel 5-tuple is unique, so collapse duplicates. Key on the RAW proto
+    // token (tcp4/tcp6/udp4/udp6) so v4 and v6 listeners on the same port
+    // (e.g. ntpd udp4/udp6 *:123) survive the TCP/UDP normalisation.
+    let mut seen = std::collections::HashSet::new();
     for line in text.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         let Some(pi) = f
@@ -1178,6 +1183,9 @@ fn parse_sockstat(text: &str) -> Vec<Connection> {
         };
         let local_addr = f[pi + 1].to_string();
         let remote_addr = f[pi + 2].to_string();
+        if !seen.insert((f[pi].to_string(), local_addr.clone(), remote_addr.clone())) {
+            continue; // same socket already seen under another pid/fd
+        }
         let state = if remote_addr == "*:*" || remote_addr.ends_with(":*") {
             "LISTEN"
         } else {
@@ -1419,6 +1427,65 @@ root     sshd      1234    6 tcp6   *:22                  *:*
         // No proto token -> skipped, never panics.
         assert!(parse_sockstat("garbage line with no proto\n\n").is_empty());
         assert!(parse_sockstat("root sh 12 3 stream /var/run/x.sock\n").is_empty());
+    }
+
+    // Verbatim `sockstat -46` output captured on OPNsense 15.1 (FreeBSD 15.1),
+    // including privsep sshd duplicates, v4/v6 listeners on one port, and
+    // column-truncated IPv6 locals — the cases that shaped the parser.
+    const REAL_SOCKSTAT: &str = "\
+USER COMMAND      PID FD PROTO LOCAL ADDRESS         FOREIGN ADDRESS
+root sshd-sessi 68838  7 tcp4  10.79.10.1:22         10.79.30.141:50792
+root sshd-sessi 68050  7 tcp4  10.79.10.1:22         10.79.30.141:50792
+root sshd-sessi 69033  7 tcp4  10.79.10.1:22         10.79.30.60:53835
+root sshd-sessi 68054  7 tcp4  10.79.10.1:22         10.79.30.60:53835
+root lighttpd   51229  7 tcp4  *:443                 *:*
+root lighttpd   51229  8 tcp6  *:443                 *:*
+root lighttpd   51229  9 tcp4  *:80                  *:*
+root lighttpd   51229 10 tcp6  *:80                  *:*
+root ssh        14590  3 tcp4  192.168.11.2:12748    192.168.11.1:22
+root sshd-sessi 62774  7 tcp4  10.79.10.1:22         10.79.10.5:42442
+root sshd-sessi 62433  7 tcp4  10.79.10.1:22         10.79.10.5:42442
+root ntpd       55089 20 udp6  *:123                 *:*
+root ntpd       55089 21 udp4  *:123                 *:*
+root ntpd       55089 22 udp4  10.79.10.1:123        *:*
+root ntpd       55089 23 udp6  [fe80::ae8f:a9ff:fed7 *:*
+root ntpd       55089 24 udp6  [2600:1700:cba:8000:a *:*
+root ntpd       55089 25 udp4  104.182.185.11:123    *:*
+root ntpd       55089 26 udp4  192.168.11.2:123      *:*
+root ntpd       55089 27 udp6  [2001:506:70cb:6800:: *:*
+";
+
+    #[test]
+    fn sockstat_real_dedups_privsep_keeps_v4v6_distinct() {
+        let c = parse_sockstat(REAL_SOCKSTAT);
+        // 19 data rows -> 16 after collapsing 3 sshd privsep duplicate 5-tuples.
+        assert_eq!(c.len(), 16);
+        // v4 and v6 listeners on :123 must both survive normalisation.
+        assert_eq!(c.iter().filter(|x| x.local_addr == "*:123").count(), 2);
+        assert_eq!(
+            c.iter()
+                .filter(|x| x.process_name.as_deref() == Some("lighttpd"))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn sockstat_real_attributes_and_truncated_ipv6_survives() {
+        let c = parse_sockstat(REAL_SOCKSTAT);
+        let out = c
+            .iter()
+            .find(|x| x.local_addr == "192.168.11.2:12748")
+            .unwrap();
+        assert_eq!(out.process_name.as_deref(), Some("ssh"));
+        assert_eq!(out.state, "ESTABLISHED");
+        // Column-truncated IPv6 locals still attribute (pid/name/proto intact).
+        assert!(
+            c.iter()
+                .filter(|x| x.process_name.as_deref() == Some("ntpd"))
+                .count()
+                >= 6
+        );
     }
 
     // ── process identity (issue: version-named + truncated comm) ────────
